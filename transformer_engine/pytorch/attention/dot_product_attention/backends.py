@@ -740,7 +740,7 @@ class FlashAttention(torch.nn.Module):
         batch_size, context_len = None, None
         if inference_params is None:
             if qkv_format in ["sbhd", "bshd"]:
-                batch_size = query_layer.shape[0]
+                batch_size, context_len = query_layer.shape[0], query_layer.shape[1]
                 max_seqlen_q, max_seqlen_kv = query_layer.shape[1], key_layer.shape[1]
                 max_seqlen_q *= cp_size
                 max_seqlen_kv *= cp_size
@@ -839,6 +839,45 @@ class FlashAttention(torch.nn.Module):
                         batch_size * context_len,
                     )
 
+        # convert sbhd,bshd which are now bshd to thd for cross-doc purpose
+        enable_cross_doc_attention = False
+        if qkv_format in ["sbhd", "bshd"]:
+            query_layer = tex.convert_bshd_to_thd(
+                query_layer,
+                cu_seqlens_q,
+                batch_size * context_len,
+            )
+            key_layer = tex.convert_bshd_to_thd(
+                key_layer,
+                cu_seqlens_kv,
+                batch_size * context_len,
+            )
+            value_layer = tex.convert_bshd_to_thd(
+                value_layer,
+                cu_seqlens_kv,
+                batch_size * context_len,
+            )
+
+            # fix cu_seqlens based on attention_mask                                                                                                           
+            if attention_mask is not None:                                  
+                mask_2d = attention_mask.squeeze(1)                    # [b, sq, skv]                                                                          
+                attend_counts = mask_2d.logical_not().sum(dim=-1)      # [b, sq]                                                                               
+
+                # In a causal packed mask, attend_count==1 marks each document's first token
+                doc_start_positions = (attend_counts == 1).reshape(-1).nonzero(as_tuple=True)[0]
+
+                # doc starts ARE the cu_seqlens (offsets into the flattened thd tensor)
+                total_len = batch_size * max_seqlen_q
+                cu_seqlens_q = torch.cat([
+                    doc_start_positions.to(torch.int32),
+                    torch.tensor([total_len], dtype=torch.int32, device=query_layer.device),
+                ])
+                cu_seqlens_kv = cu_seqlens_q
+                max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+                max_seqlen_kv = max_seqlen_q
+            enable_cross_doc_attention = True
+                
+
         use_flash_attn_3 = False
         if flash_attention_backend is not None and flash_attention_backend > PkgVersion("3.0.0b"):
             use_flash_attn_3 = True
@@ -900,7 +939,7 @@ class FlashAttention(torch.nn.Module):
                 #       | flash_attn_with_kvcache | KV cache (not-paged/paged), i.e.
                 #       |                         |     bshd/sbhd/thd + padding
                 fa_optional_forward_args_thd = []
-                if qkv_format in ["bshd", "sbhd"] and "padding" not in attn_mask_type:
+                if qkv_format in ["bshd", "sbhd"] and "padding" not in attn_mask_type and not enable_cross_doc_attention:
                     func = (
                         flash_attn_func if not use_flash_attn_3 else flash_attn_func_v3
                     )  # pylint: disable=possibly-used-before-assignment
@@ -1026,6 +1065,12 @@ class FlashAttention(torch.nn.Module):
         if inference_params is None:
             if qkv_format in ["sbhd", "bshd"] and "padding" in attn_mask_type:
                 output = dpa_utils.UnpackTensor.apply(indices_q, batch_size * max_seqlen_q, output)
+            elif qkv_format == "sbhd":
+                # convert back
+                output = output.view(batch_size, context_len, -1).transpose(0, 1)
+            elif qkv_format == "bshd":
+                # convert back
+                output = output.view(batch_size, context_len, -1)
         elif qkv_format in ["bshd", "sbhd_2bshd"]:
             # all KV caching cases use thd_2bshd for calculation
             # convert results back to bshd from thd_2bshd
@@ -1045,27 +1090,28 @@ class FlashAttention(torch.nn.Module):
                     context_len,
                 )
 
-        if q_format == "sbhd":
-            # (bs)hd -> bs(hd) -> sb(hd)
-            if fp8 and fp8_output:
-                output_data = (
-                    output._data.reshape(batch_size, max_seqlen_q // cp_size, -1)
-                    .transpose(0, 1)
-                    .contiguous()
-                )
-                output = Float8Tensor.make_like(
-                    output,
-                    data=output_data,
-                    shape=output_data.shape,
-                )
-            else:
-                output = output.view(batch_size, max_seqlen_q // cp_size, -1).transpose(0, 1)
-        elif q_format == "bshd":
-            # (bs)hd -> bs(hd)
-            output = output.reshape(batch_size, max_seqlen_q // cp_size, -1)
-        elif q_format == "thd":
-            # thd -> t(hd)
-            output = output.reshape(output.shape[0], -1)
+        if not enable_cross_doc_attention:
+            if q_format == "sbhd":
+                # (bs)hd -> bs(hd) -> sb(hd)
+                if fp8 and fp8_output:
+                    output_data = (
+                        output._data.reshape(batch_size, max_seqlen_q // cp_size, -1)
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+                    output = Float8Tensor.make_like(
+                        output,
+                        data=output_data,
+                        shape=output_data.shape,
+                    )
+                else:
+                    output = output.view(batch_size, max_seqlen_q // cp_size, -1).transpose(0, 1)
+            elif q_format == "bshd":
+                # (bs)hd -> bs(hd)
+                output = output.reshape(batch_size, max_seqlen_q // cp_size, -1)
+            elif q_format == "thd":
+                # thd -> t(hd)
+                output = output.reshape(output.shape[0], -1)
 
         return output.contiguous()
 
